@@ -31,7 +31,8 @@ Windows 一键运行，纯 Python 标准库实现，无需 pip 安装任何依�
 
 ### 方式一：下载 EXE（推荐）
 
-到 [**Releases**](../../releases) 页面下载 `LAN Transfer.exe`，双击运行：
+到 [**Releases**](https://github.com/jay1006447979-svg/lan-transfer/releases/latest) 页面
+下载 `LAN-Transfer.exe`，双击运行：
 
 1. 窗口里会先显示**使用说明**
 2. 按回车键启动服务
