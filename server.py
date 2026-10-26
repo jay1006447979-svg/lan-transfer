@@ -55,13 +55,14 @@ struct_pack = struct.pack
 # ─────────────────────────── 常量 ───────────────────────────
 
 APP_NAME = "LAN Transfer"
-VERSION = "2.0"
+VERSION = "2.1"
 
 DEFAULT_PORT = 9876
 DEFAULT_DIR = "shared_files"
 
 # 内部数据目录（分块暂存 + SQLite），位于共享目录下的同名子目录
 STATE_DIRNAME = ".lan_transfer"
+INTERNAL_DIR_NAME = STATE_DIRNAME
 # 下载/上传时使用的套接字读写块大小
 IO_CHUNK = 1024 * 1024
 # 单个上传分块上限（前端按 16MB 切片，这里留足余量防滥用）
@@ -110,8 +111,12 @@ def human_size(n: float) -> str:
 
 
 def is_indexable(name: str) -> bool:
-    """内部文件 / 目录是否应被隐藏（不展示、不打包、不可下载）。"""
-    return name.startswith("_") or name.startswith(".")
+    """内部文件 / 目录是否应被隐藏（不展示、不打包、不可下载）。
+
+    只隐藏服务自己的状态目录；用户的隐藏文件（.git、.DS_Store 等）
+    是正常上传内容，照常展示。
+    """
+    return name == INTERNAL_DIR_NAME or name.startswith(".ltmp_")
 
 
 def safe_join(base: str, rel: str):
@@ -133,7 +138,10 @@ def safe_join(base: str, rel: str):
     for p in parts:
         if p == "..":
             return None, "路径不合法"
-        if is_indexable(p):
+        # 只拦截服务内部目录；用户文件/目录以 "." 或 "_" 开头（如 .git、
+        # .DS_Store、_cache）是合法的，不应拒绝 —— 否则上传包含它们的
+        # 文件夹会整批失败。
+        if p == INTERNAL_DIR_NAME:
             return None, "路径不合法"
         if any(ch in p for ch in '<>:"|?*'):
             return None, "路径含非法字符"
@@ -146,11 +154,25 @@ def safe_join(base: str, rel: str):
     return target, norm
 
 
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
 def sanitize_filename(name: str, fallback: str = "unnamed") -> str:
     """清理浏览器传来的文件名（可能是路径）。"""
-    name = (name or "").replace("\\", "/").split("/")[-1]
-    name = name.strip().strip(".")
+    name = (name or "").replace("\\", "/").split("/")[-1].strip()
+    # 纯点（"..""、"..." 等）不能当文件名；正常隐藏文件（.DS_Store）保留前导点
+    if not name.strip("."):
+        return fallback
     name = re.sub(r'[<>:"|?*\x00-\x1f]', "_", name)
+    # Windows 保留设备名（CON、NUL、COM1…，含带扩展名形式）不能直接当
+    # 普通文件创建/删除 —— 会命中设备而非文件，加前缀规避。
+    stem = name.split(".")[0].upper()
+    if stem in _WINDOWS_RESERVED:
+        name = "_" + name
     return name[:200] or fallback
 
 
@@ -402,15 +424,29 @@ def upload_merge(upload_id: str):
             " VALUES (?,?,?,?,?,?,1,?)",
             (uuid.uuid4().hex, time.time(), "up", rel, size, None, "分块上传"),
         )
-    # 立即释放分块（若该分块被别的会话共享，则删除文件时会失败，忽略即可）
-    for f in set(have.values()):
+    # 释放分块。分块文件按内容哈希跨会话共享 —— 必须确认没有其它会话
+    # 还引用同一分块后才能删文件，否则同批上传内容相同（或共享相同分块，
+    # 例如全零块）的文件，第二个合并时就会报「文件不存在」而失败。
+    with db() as conn:
+        sha_set = list(set(have.values()))
+        marks = ",".join("?" * len(sha_set))
+        still_used = {
+            r["file"]
+            for r in conn.execute(
+                f"SELECT DISTINCT file FROM chunks "
+                f"WHERE upload_id<>? AND file IN ({marks})",
+                (upload_id, *sha_set),
+            ).fetchall()
+        }
+        conn.execute("DELETE FROM chunks WHERE upload_id=?", (upload_id,))
+    for f in sha_set:
+        if f in still_used:
+            continue
         p = os.path.join(STAGING_DIR, f)
         try:
             os.remove(p)
         except OSError:
             pass
-    with db() as conn:
-        conn.execute("DELETE FROM chunks WHERE upload_id=?", (upload_id,))
 
     with _stats_lock:
         _stats["uploaded_files"] += 1
@@ -741,6 +777,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .msg.ok{background:var(--okbg);color:var(--ok)}
   .msg.err{background:var(--errbg);color:var(--err)}
   .msg.warn{background:var(--card2);color:var(--warn)}
+  .fdetail{border:1px solid var(--errbg);border-radius:10px;padding:6px 10px;max-height:220px;overflow-y:auto;background:var(--card2)}
+  .fdetail .fd-title{font-size:.82em;font-weight:600;opacity:.75;margin:4px 0 2px}
+  .fdetail .fd-item{font-size:.82em;padding:5px 2px;border-bottom:1px solid var(--line);word-break:break-all}
+  .fdetail .fd-item:last-child{border-bottom:none}
+  .fdetail .fd-item .why{color:var(--err);display:block;margin-top:2px}
+  .fdetail .fd-item .fn{font-weight:600}
   .scroll{max-height:340px;overflow-y:auto}
   .hitem{padding:10px 12px;background:var(--card);border:1px solid var(--line);border-radius:12px;margin-bottom:8px}
   .hitem .t{font-size:.73em;color:var(--text2);margin-bottom:5px;display:flex;justify-content:space-between;gap:8px}
@@ -820,6 +862,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
       <div class="msg" id="fmsg"></div>
+      <div id="fdetail" style="display:none;margin-top:8px"></div>
     </div>
 
     <div class="card">
@@ -1041,8 +1084,21 @@ async function upload(files){
   upCtl.running=true;
   const prog=$('#prog');prog.classList.add('on');
   const fill=$('#fill'),pl=$('#pl'),pr=$('#pr');
+  const detail=$('#fdetail');
   const total=files.length;
-  let okCount=0,failCount=0;
+  let okCount=0;
+  const failures=[];   // {name, why}
+
+  function renderFailures(){
+    if(!failures.length){detail.style.display='none';detail.innerHTML='';return}
+    detail.style.display='block';
+    detail.innerHTML='<div class="fdetail">'
+      +'<div class="fd-title">失败明细（'+failures.length+' 个）</div>'
+      +failures.map(function(f){
+        return '<div class="fd-item"><span class="fn">📄 '+esc(f.name)+'</span>'
+          +'<span class="why">原因：'+esc(f.why)+'</span></div>';
+      }).join('')+'</div>';
+  }
 
   for(let n=0;n<total;n++){
     const file=files[n];
@@ -1054,8 +1110,12 @@ async function upload(files){
     try{
       await uploadOne(file,label,fill,pl,pr,function(){return aborted});
       okCount++;
+      // 该文件此前若失败过（重传场景），从失败列表里移除
+      const fi=failures.findIndex(function(f){return f.name===(rel||file.name)});
+      if(fi>=0){failures.splice(fi,1);renderFailures()}
     }catch(e){
-      failCount++;
+      failures.push({name:(rel||file.name),why:e.message});
+      renderFailures();
       msg('#fmsg','err','❌ '+label+' 失败：'+e.message);
     }
     if(aborted){msg('#fmsg','warn','已取消，'+okCount+' 个文件已完成（未完成的可稍后重传，会自动续传）');break}
@@ -1063,8 +1123,12 @@ async function upload(files){
 
   upCtl.running=false;upCtl.abort=null;
   setTimeout(function(){prog.classList.remove('on')},900);
-  if(!failCount&&okCount)msg('#fmsg','ok','✅ 全部完成，共 '+okCount+' 个文件');
-  else if(failCount)msg('#fmsg','err','完成 '+okCount+' 个，失败 '+failCount+' 个');
+  if(!failures.length&&okCount){
+    msg('#fmsg','ok','✅ 全部完成，共 '+okCount+' 个文件');
+    setTimeout(function(){detail.style.display='none'},1500);
+  }else if(failures.length){
+    msg('#fmsg','err','完成 '+okCount+' 个，失败 '+failures.length+' 个（明细见下方列表）');
+  }
   load();
 }
 
@@ -1087,7 +1151,11 @@ function uploadOne(file,label,fill,pl,pr,isAborted){
     let right='';
     if(speed>0)right=fmtSpeed(speed);
     if(eta>0&&eta<86400)right+=(right?' · ':'')+'剩 '+secs(eta);
-    if(speed>0)right+=(right?' · ':'')+'均 '+fmtSpeed(done/((Date.now()-startTime)/1000));
+    // 均速只用「服务端已确认」的字节 —— 否则续传时会把之前已传的算进来虚高
+    if(sessionStart>0&&speed>0){
+      const avg=sessionBytes/((Date.now()-sessionStart)/1000);
+      if(avg>0)right+=(right?' · ':'')+'均 '+fmtSpeed(avg);
+    }
     pr.textContent=right;
   }
   function fmtSpeed(bps){
@@ -1120,7 +1188,31 @@ function uploadOne(file,label,fill,pl,pr,isAborted){
       for(let i=0;i<totalChunks;i++)if(!have[i])todo.push(i);
       if(!todo.length){return doMerge()}
 
-      let idx=0,lastTick=Date.now(),lastBytes=bytesDone,curSpeed=0;
+      // ── 速度统计只基于「服务端已确认收到」的字节 ──
+      // xhr.upload.onprogress 统计的是浏览器写入本机 socket 缓冲区的字节，
+      // 局域网上 TCP 缓冲会让它比服务端实际接收快 30%~50% —— 那正是
+      // 「显示 90 多 MB/s、实际只有 60 多」的原因。分块 onload（服务端
+      // 已落盘并应答）才是真实速度。
+      let sessionBytes=0,sessionStart=0,curSpeed=0;
+      let lastAckTick=0,lastAcked=0;
+      const ackedBase=bytesDone;   // 续传时服务端已有字节的基数
+      function onAck(n){
+        sessionBytes+=n;
+        const now=Date.now();
+        if(!sessionStart)sessionStart=now;
+        if(lastAckTick){
+          const dt=(now-lastAckTick)/1000;
+          if(dt>=0.25){
+            const inst=(sessionBytes+ackedBase-lastAcked)/dt;
+            curSpeed=curSpeed?curSpeed*0.6+inst*0.4:inst;
+            lastAckTick=now;lastAcked=sessionBytes+ackedBase;
+          }
+        }else{
+          lastAckTick=now;lastAcked=sessionBytes+ackedBase;
+        }
+      }
+
+      let idx=0;
       function next(){
         if(isAborted()){reject(new Error('已取消'))}
         if(idx>=todo.length){return doMerge()}
@@ -1146,11 +1238,7 @@ function uploadOne(file,label,fill,pl,pr,isAborted){
             reject(new Error('分块 '+(ci+1)+' 失败：'+em));return;
           }
           bytesDone+=(end-start);
-          const now=Date.now();
-          if(now-lastTick>500){
-            curSpeed=(bytesDone-lastBytes)/((now-lastTick)/1000);
-            lastTick=now;lastBytes=bytesDone;
-          }
+          onAck(end-start);
           const remain=file.size-bytesDone;
           setBar(bytesDone,file.size,curSpeed,curSpeed>0?remain/curSpeed:0);
           idx++;next();
@@ -1158,14 +1246,10 @@ function uploadOne(file,label,fill,pl,pr,isAborted){
         xhr.onerror=function(){
           reject(new Error('网络中断或无法连接服务端（已传部分会保留，重新选择该文件可续传）'))
         };
+        // onprogress 只用来平滑进度条动画，不参与速度计算
         xhr.upload.onprogress=function(e){
           if(e.lengthComputable){
-            const now=Date.now();
-            if(now-lastTick>400){
-              curSpeed=(bytesDone+e.loaded-lastBytes)/((now-lastTick)/1000);
-              lastTick=now;lastBytes=bytesDone;
-            }
-            const cur=bytesDone+e.loaded;
+            const cur=Math.min(bytesDone+e.loaded,file.size);
             setBar(cur,file.size,curSpeed,curSpeed>0?(file.size-cur)/curSpeed:0);
           }
         };
@@ -1177,11 +1261,12 @@ function uploadOne(file,label,fill,pl,pr,isAborted){
         fetch(API+'/api/upload/merge',{
           method:'POST',headers:hdrs({'Content-Type':'application/json'}),
           body:JSON.stringify({uploadId:uploadId})
-        }).then(function(r){return r.json().then(function(j){return{r:r,j:j}})}).then(function(o){
+        }).then(function(r){return r.json().then(function(j){return{r:r,j:j}})        }).then(function(o){
           if(!o.r.ok||!o.j.ok)throw new Error(o.j.error||'合并失败');
           fill.style.width='100%';
           pl.textContent=label+' · 完成';
-          const avg=file.size/((Date.now()-startTime)/1000);
+          const dur=(Date.now()-(sessionStart||startTime))/1000;
+          const avg=sessionBytes>0&&dur>0?sessionBytes/dur:file.size/((Date.now()-startTime)/1000);
           pr.textContent=size(file.size)+' · 平均 '+fmtSpeed(avg);
           resolve();
         }).catch(reject);
@@ -1545,11 +1630,32 @@ class Handler(BaseHTTPRequestHandler):
         mtime = float(data.get("mtime") or 0)
 
         rec = upload_create(name, rel_path, size, chunk_size, total, mtime)
+        done = rec["status"] == "done"
+        if done:
+            # 会话标记为完成，但最终文件可能已被用户删除 —— 此时重置会话，
+            # 让前端重新上传，而不是直接返回 done 导致「传了却没文件」。
+            fp = rec["final_path"] or ""
+            if not fp or not os.path.isfile(os.path.join(SHARE_DIR, fp)):
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE uploads SET status='active', final_path=NULL "
+                        "WHERE id=?", (rec["id"],))
+                    conn.execute(
+                        "DELETE FROM chunks WHERE upload_id=?", (rec["id"],))
+                rec = upload_get(rec["id"])
+                done = False
+
+        # 续传列表只报告分块文件真实存在的分块。分块文件可能因清理 / 异常
+        # 丢失，若照常报告 have，前端会跳过它，合并时才报错 —— 这里剔除后
+        # 前端会自动重传缺失分块，续传自愈。
         with db() as conn:
             rows = conn.execute(
-                "SELECT idx FROM chunks WHERE upload_id=?", (rec["id"],)
+                "SELECT idx, file FROM chunks WHERE upload_id=?", (rec["id"],)
             ).fetchall()
-        have = sorted(r["idx"] for r in rows)
+        have = sorted(
+            r["idx"] for r in rows
+            if os.path.isfile(os.path.join(STAGING_DIR, r["file"]))
+        )
         uploaded = upload_uploaded_bytes(rec["id"])
 
         self.json_out({
@@ -1557,7 +1663,7 @@ class Handler(BaseHTTPRequestHandler):
             "uploadId": rec["id"],
             "have": have,
             "uploaded": uploaded,
-            "done": rec["status"] == "done",
+            "done": done,
             "name": rec["name"],
             "totalChunks": rec["total_chunks"],
         })
