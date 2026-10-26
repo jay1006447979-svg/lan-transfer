@@ -1143,6 +1143,11 @@ function uploadOne(file,label,fill,pl,pr,isAborted){
   const startTime=Date.now();
   let bytesDone=0;
   let uploadId=null;
+  // ── 速度统计状态（setBar/onAck 共用，必须声明在 uploadOne 顶层，
+  //    否则 setBar 引用不到会抛 ReferenceError: sessionStart is not defined）
+  let sessionBytes=0,sessionStart=0,curSpeed=0;   // 服务端确认字节 / 首次确认时刻 / 平滑速度
+  let lastAckTick=0,lastAcked=0;
+  let ackedBase=0;                                // 续传时服务端已有字节的基数
 
   function setBar(done,totalBytes,speed,eta){
     const pct=totalBytes>0?Math.min(100,done/totalBytes*100):0;
@@ -1192,10 +1197,8 @@ function uploadOne(file,label,fill,pl,pr,isAborted){
       // xhr.upload.onprogress 统计的是浏览器写入本机 socket 缓冲区的字节，
       // 局域网上 TCP 缓冲会让它比服务端实际接收快 30%~50% —— 那正是
       // 「显示 90 多 MB/s、实际只有 60 多」的原因。分块 onload（服务端
-      // 已落盘并应答）才是真实速度。
-      let sessionBytes=0,sessionStart=0,curSpeed=0;
-      let lastAckTick=0,lastAcked=0;
-      const ackedBase=bytesDone;   // 续传时服务端已有字节的基数
+      // 已落盘并应答）才是真实速度。状态变量声明在 uploadOne 顶层。
+      ackedBase=bytesDone;
       function onAck(n){
         sessionBytes+=n;
         const now=Date.now();
