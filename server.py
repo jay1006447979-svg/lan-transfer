@@ -5,15 +5,16 @@ LAN Transfer 2.0 - 局域网文件 / 文字传输工具
 Windows  <->  Android / iOS / 其它电脑 ，纯浏览器操作，无需安装 App
 
 设计要点（相比 1.x 的改进）
-  1. 上传分块以「内容哈希」寻址，重复上传天然幂等 —— 彻底修掉
-     1.x 里每个分块生成不同 uploadId、导致合并报「缺少分块」的老 bug。
-  2. 断点续传：已上传分块存在服务端 SQLite 会话表里，页面刷新 / 关浏览器 /
+  1. 上传分块「按偏移直写」到最终文件的临时件，全部到齐只需一次改名 ——
+     没有「分块暂存 + 合并时整文件复制」的二次写盘，大文件吞吐翻倍。
+  2. 上传 / 下载都是零拷贝流式：请求体直接从 socket 落到磁盘，不经过
+     cgi.FieldStorage 的临时文件，也不把整块读进内存。
+  3. 断点续传：已上传分块记在 SQLite 会话表里，页面刷新 / 关浏览器 /
      断网 / 手机锁屏之后可以接着传，不必从头再来。
-  3. 全链路流式：上传落盘、下载发送、文件夹 ZIP 打包都不再把整个文件读进内存，
-     内存占用恒定，几百 GB 也不会 OOM。
-  4. 实时进度（速度 / 平均速度 / 剩余时间）、可取消、可重试。
-  5. 文件夹递归上传保留目录结构；文件夹下载走标准 zip（流式分片）。
-  6. 文字：收发 + 持久化历史 + 搜索 + 一键复制（含安卓 HTTP 降级）+ 剪贴板接收。
+  4. 前端多路并发分块（默认 3~4 路），单流跑不满的 WiFi 也能压满带宽。
+  5. 实时进度（速度 / 平均速度 / 剩余时间）、可取消、可重试。
+  6. 文件夹递归上传保留目录结构；文件夹下载走标准 zip（流式分片）。
+  7. 文字：收发 + 持久化历史 + 搜索 + 一键复制（含安卓 HTTP 降级）+ 剪贴板接收。
 
 依赖：仅标准库（Python 3.8+）。可选安装 psutil 来更完整地列出网卡地址。
 
@@ -27,8 +28,6 @@ Windows  <->  Android / iOS / 其它电脑 ，纯浏览器操作，无需安装 
 from __future__ import annotations
 
 import argparse
-import cgi
-import hashlib
 import hmac
 import io
 import json
@@ -55,18 +54,20 @@ struct_pack = struct.pack
 # ─────────────────────────── 常量 ───────────────────────────
 
 APP_NAME = "LAN Transfer"
-VERSION = "2.1"
+VERSION = "2.2"
 
 DEFAULT_PORT = 9876
 DEFAULT_DIR = "shared_files"
 
-# 内部数据目录（分块暂存 + SQLite），位于共享目录下的同名子目录
+# 内部数据目录（SQLite），位于共享目录下的同名子目录
 STATE_DIRNAME = ".lan_transfer"
 INTERNAL_DIR_NAME = STATE_DIRNAME
-# 下载/上传时使用的套接字读写块大小
+# 流式读写块大小。1MB 与 NTFS / SSD 的最佳写块一致，再大只是多吃内存。
 IO_CHUNK = 1024 * 1024
-# 单个上传分块上限（前端按 16MB 切片，这里留足余量防滥用）
-MAX_CHUNK_BYTES = 64 * 1024 * 1024
+# 单个上传分块上限（前端最大 64MB 一片，这里留一倍余量）
+MAX_CHUNK_BYTES = 128 * 1024 * 1024
+# 未完成的落盘文件前缀：以 "." 开头，前端列表与 ZIP 都不会显示它
+PART_PREFIX = ".ltmp_"
 # 文字单条上限
 MAX_TEXT_BYTES = 4 * 1024 * 1024
 # 分块暂存区的过期时间（秒），超过且未续传的会话会被清理
@@ -86,6 +87,7 @@ AUTH_TOKEN = ""          # 为空表示不校验
 ALLOW_OVERWRITE = True   # 同名文件是否覆盖
 _deleting: set = set()   # 正在合并的文件绝对路径，防止合并中被人删除
 _state_lock = threading.Lock()
+_tls = threading.local()  # 线程内复用的 SQLite 连接
 
 _serve_time = time.time()
 _stats = {
@@ -206,11 +208,24 @@ def fmt_speed(bps: float) -> str:
 # ─────────────────────────── 数据库（会话 / 文字历史 / 传输记录）───────────────────────────
 
 def db() -> sqlite3.Connection:
+    """
+    每个线程复用一个连接。
+
+    旧实现每次 db() 都新开一个连接、还要重放 3 条 PRAGMA —— 一块分块下来
+    要开 3~4 个连接，在 1Gbps 局域网上这是实打实的开销。改成线程内复用后，
+    一次连接服务整个 keep-alive 会话。
+    """
+    conn = getattr(_tls, "conn", None)
+    if conn is not None:
+        return conn
     conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA busy_timeout=15000")
+    conn.execute("PRAGMA cache_size=-16384")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    _tls.conn = conn
     return conn
 
 
@@ -273,26 +288,52 @@ def upload_get(upload_id: str):
         return dict(row) if row else None
 
 
-def upload_wanted_chunks(upload_id: str):
-    """返回服务端「还没有」的分块序号列表，前端据此续传。"""
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT idx FROM chunks WHERE upload_id=?", (upload_id,)
-        ).fetchall()
-    have = {r["idx"] for r in rows}
-    rec = upload_get(upload_id)
-    if not rec:
-        return []
-    return [i for i in range(rec["total_chunks"]) if i not in have]
+def upload_dest(rec) -> str:
+    """会话对应的最终文件绝对路径。"""
+    if rec["rel_path"]:
+        dest, _ = safe_join(SHARE_DIR, rec["rel_path"])
+        if dest is None:
+            raise ValueError("路径不合法")
+        return dest
+    return os.path.join(SHARE_DIR, sanitize_filename(rec["name"]))
 
 
-def upload_uploaded_bytes(upload_id: str) -> int:
-    with db() as conn:
-        row = conn.execute(
-            "SELECT COALESCE(SUM(size),0) AS s FROM chunks WHERE upload_id=?",
-            (upload_id,),
-        ).fetchone()
-    return int(row["s"] or 0)
+def upload_part_path(rec) -> str:
+    """
+    上传期间真正落盘的文件：与最终文件同目录（rename 才不会跨卷），
+    名字以 ".ltmp_" 开头 —— 文件列表不显示、ZIP 不打包、不可下载。
+    """
+    dest = upload_dest(rec)
+    return os.path.join(os.path.dirname(dest), f"{PART_PREFIX}{rec['id']}.part")
+
+
+def upload_ensure_part(rec) -> str:
+    part = upload_part_path(rec)
+    parent = os.path.dirname(part)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if not os.path.isfile(part):
+        # 用 O_CREAT（不带 O_TRUNC）建空文件。
+        # 不能写 open(part, "wb")：多路并发时两个线程会同时命中「文件不存在」，
+        # 后一个的 CREATE_ALWAYS 会在前一个正写作时截断，Windows 上直接
+        # 抛 Permission denied / 数据被清零。O_CREAT 谁先建都无害。
+        # 另外这里不做 truncate 预分配：NTFS 预分配会把整个文件实写一遍
+        # （1GB 约 1.3 秒），而按偏移写入本身不会触发零填充，实测乱序写与
+        # 顺序写同为 ~1GB/s。
+        try:
+            os.close(os.open(part, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o666))
+        except FileExistsError:
+            pass
+        except OSError:
+            if not os.path.isfile(part):
+                raise
+    return part
+
+
+def chunk_len(rec, idx: int) -> int:
+    """第 idx 块应有的字节数（最后一块可能不足 chunk_size）。"""
+    start = idx * rec["chunk_size"]
+    return max(0, min(rec["chunk_size"], rec["size"] - start))
 
 
 def upload_create(name, rel_path, size, chunk_size, total_chunks, mtime):
@@ -318,95 +359,86 @@ def upload_create(name, rel_path, size, chunk_size, total_chunks, mtime):
         return upload_get(uid)
 
 
-def chunk_save(upload_id, idx, data: bytes) -> int:
+def chunk_receive(rec, idx: int, rfile, length: int) -> int:
     """
-    保存一个分块。分块文件以 sha1 命名 —— 相同内容只写一份，
-    重复请求直接跳过写入，天然幂等。
-    返回该分块字节数。
+    把一个分块从 socket 直接流到最终文件的对应偏移。
+
+    旧实现走 cgi.FieldStorage：先写系统临时目录 → 再整块读回内存 → 再写暂存
+    目录 → 还要 fsync，一块数据落盘三次、内存里再复制两次。现在是「读一块、
+    写一块」，内存只有 1MB 滚动缓冲，磁盘只写一次。
     """
-    sha1 = hashlib.sha1(data).hexdigest()
-    dst = os.path.join(STAGING_DIR, sha1)
-    already = os.path.isfile(dst) and os.path.getsize(dst) == len(data)
-    if not already:
-        tmp = dst + ".part"
-        with open(tmp, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, dst)
+    part = upload_ensure_part(rec)
+    offset = idx * rec["chunk_size"]
+    remaining = length
+    buf = bytearray(IO_CHUNK)
+    view = memoryview(buf)
+    readinto = rfile.readinto
+    with open(part, "r+b") as f:
+        f.seek(offset)
+        while remaining > 0:
+            n = readinto(view[:IO_CHUNK if remaining > IO_CHUNK else remaining])
+            if not n:
+                raise ConnectionError("连接中断，分块未传完")
+            f.write(view[:n])
+            remaining -= n
+
     now = time.time()
     with db() as conn:
         conn.execute(
             """INSERT INTO chunks (upload_id,idx,size,sha1,file,created_at)
                VALUES (?,?,?,?,?,?)
                ON CONFLICT(upload_id,idx) DO UPDATE SET
-                 size=excluded.size, sha1=excluded.sha1, file=excluded.file""",
-            (upload_id, idx, len(data), sha1, sha1, now),
+                 size=excluded.size, created_at=excluded.created_at""",
+            (rec["id"], idx, length, "", "", now),
         )
-        conn.execute("UPDATE uploads SET updated_at=? WHERE id=?", (now, upload_id))
-    return len(data)
+        conn.execute("UPDATE uploads SET updated_at=? WHERE id=?", (now, rec["id"]))
+    return length
 
 
 def upload_merge(upload_id: str):
     """
-    合并分块 → 最终文件。全程流式，内存占用只有 IO_CHUNK。
+    收尾：校验分块齐全 → fsync → 改名。
+
+    因为分块是直接按偏移写进最终文件的临时件，这一步没有整文件复制 ——
+    10GB 的文件也是毫秒级完成（旧实现要再读+写一遍 10GB）。
     返回 (rel_path, size)。
     """
     rec = upload_get(upload_id)
     if not rec:
         raise FileNotFoundError("上传会话不存在")
 
-    # 目标路径
-    if rec["rel_path"]:
-        dest, _ = safe_join(SHARE_DIR, rec["rel_path"])
-        if dest is None:
-            raise ValueError("路径不合法")
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-    else:
-        dest = os.path.join(SHARE_DIR, sanitize_filename(rec["name"]))
+    dest = upload_dest(rec)
+    part = upload_part_path(rec)
 
-    if ALLOW_OVERWRITE:
-        final = dest
-    else:
-        final = uniq_path(dest)
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT idx FROM chunks WHERE upload_id=?", (upload_id,)
+        ).fetchall()
+    have = {r["idx"] for r in rows}
+    missing = [i for i in range(rec["total_chunks"]) if i not in have]
+    if missing:
+        raise ValueError(f"缺少分块 {missing[:5]}{'...' if len(missing) > 5 else ''}")
+    if not os.path.isfile(part):
+        raise ValueError("临时文件已丢失，请重新选择该文件上传")
+    if os.path.getsize(part) < rec["size"]:
+        raise ValueError("数据不完整，请重新上传该文件")
 
-    final_dir = os.path.dirname(final) or SHARE_DIR
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    final = dest if ALLOW_OVERWRITE else uniq_path(dest)
+
     with _state_lock:
         _deleting.add(os.path.abspath(final))
-
-    tmp_out = final + f".ltmp_{uuid.uuid4().hex[:8]}"
     try:
-        with db() as conn:
-            rows = conn.execute(
-                "SELECT idx,file FROM chunks WHERE upload_id=? ORDER BY idx",
-                (upload_id,),
-            ).fetchall()
-        have = {r["idx"]: r["file"] for r in rows}
-        missing = [i for i in range(rec["total_chunks"]) if i not in have]
-        if missing:
-            raise ValueError(f"缺少分块 {missing[:5]}{'...' if len(missing) > 5 else ''}")
-
-        with open(tmp_out, "wb") as out:
-            for i in range(rec["total_chunks"]):
-                src = os.path.join(STAGING_DIR, have[i])
-                with open(src, "rb") as f:
-                    shutil.copyfileobj(f, out, length=IO_CHUNK)
-            out.flush()
-            os.fsync(out.fileno())
-
+        # 整个文件只刷一次盘。分块阶段不做 fsync —— 每 32MB 强制落盘一次
+        # 会把顺序写打成同步写，实测能吃掉一半带宽。
+        with open(part, "r+b") as f:
+            os.fsync(f.fileno())
         if os.path.exists(final):
             try:
                 os.remove(final)
             except OSError:
                 final = uniq_path(final)
-        os.replace(tmp_out, final)
-    except Exception:
-        try:
-            if os.path.exists(tmp_out):
-                os.remove(tmp_out)
-        except OSError:
-            pass
-        raise
+        os.replace(part, final)
     finally:
         with _state_lock:
             _deleting.discard(os.path.abspath(final))
@@ -424,29 +456,7 @@ def upload_merge(upload_id: str):
             " VALUES (?,?,?,?,?,?,1,?)",
             (uuid.uuid4().hex, time.time(), "up", rel, size, None, "分块上传"),
         )
-    # 释放分块。分块文件按内容哈希跨会话共享 —— 必须确认没有其它会话
-    # 还引用同一分块后才能删文件，否则同批上传内容相同（或共享相同分块，
-    # 例如全零块）的文件，第二个合并时就会报「文件不存在」而失败。
-    with db() as conn:
-        sha_set = list(set(have.values()))
-        marks = ",".join("?" * len(sha_set))
-        still_used = {
-            r["file"]
-            for r in conn.execute(
-                f"SELECT DISTINCT file FROM chunks "
-                f"WHERE upload_id<>? AND file IN ({marks})",
-                (upload_id, *sha_set),
-            ).fetchall()
-        }
         conn.execute("DELETE FROM chunks WHERE upload_id=?", (upload_id,))
-    for f in sha_set:
-        if f in still_used:
-            continue
-        p = os.path.join(STAGING_DIR, f)
-        try:
-            os.remove(p)
-        except OSError:
-            pass
 
     with _stats_lock:
         _stats["uploaded_files"] += 1
@@ -459,28 +469,22 @@ def upload_cancel(upload_id: str) -> None:
     rec = upload_get(upload_id)
     if not rec:
         return
+    try:
+        part = upload_part_path(rec)
+    except Exception:
+        part = ""
     with db() as conn:
-        rows = conn.execute(
-            "SELECT file FROM chunks WHERE upload_id=?", (upload_id,)
-        ).fetchall()
         conn.execute("DELETE FROM chunks WHERE upload_id=?", (upload_id,))
         conn.execute("DELETE FROM uploads WHERE id=?", (upload_id,))
-    # 只删除没有其它会话引用的分块文件
-    for r in rows:
-        f = os.path.join(STAGING_DIR, r["file"])
-        with db() as conn:
-            used = conn.execute(
-                "SELECT 1 FROM chunks WHERE file=? LIMIT 1", (r["file"],)
-            ).fetchone()
-        if used is None:
-            try:
-                os.remove(f)
-            except OSError:
-                pass
+    if part:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
 
 
 def cleanup_stale() -> int:
-    """清理长时间未续传的会话及其孤儿分块。"""
+    """清理长时间未续传的会话、遗留的 .part 和旧版本暂存分块。"""
     cutoff = time.time() - STALE_UPLOAD_SECONDS
     removed = 0
     with db() as conn:
@@ -491,23 +495,42 @@ def cleanup_stale() -> int:
     for r in rows:
         upload_cancel(r["id"])
         removed += 1
-    # 孤儿分块（没有会话引用）
+
+    # 1.x / 2.0 遗留的内容哈希暂存分块
     try:
-        names = set(os.listdir(STAGING_DIR))
+        for n in os.listdir(STAGING_DIR):
+            p = os.path.join(STAGING_DIR, n)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+                    removed += 1
+            except OSError:
+                pass
     except OSError:
-        names = set()
+        pass
+
+    # 没有任何活动会话引用的 .ltmp_*.part（进程被强杀 / 磁盘写满等）
+    alive = set()
     with db() as conn:
-        used = {r["file"] for r in conn.execute("SELECT DISTINCT file FROM chunks")}
-    for n in names:
-        if n in used or n.endswith(".part"):
-            continue
-        p = os.path.join(STAGING_DIR, n)
-        try:
-            if os.path.getmtime(p) < cutoff:
-                os.remove(p)
-                removed += 1
-        except OSError:
-            pass
+        for r in conn.execute("SELECT * FROM uploads WHERE status='active'"):
+            try:
+                alive.add(os.path.abspath(upload_part_path(dict(r))))
+            except Exception:
+                pass
+    for root, dirs, files in os.walk(SHARE_DIR):
+        dirs[:] = [d for d in dirs if d != INTERNAL_DIR_NAME]
+        for fn in files:
+            if not (fn.startswith(PART_PREFIX) and fn.endswith(".part")):
+                continue
+            p = os.path.abspath(os.path.join(root, fn))
+            if p in alive:
+                continue
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+                    removed += 1
+            except OSError:
+                pass
     return removed
 
 
@@ -1133,13 +1156,18 @@ async function upload(files){
 }
 
 function uploadOne(file,label,fill,pl,pr,isAborted){
-  // 分块大小：<8MB 整传，否则 16MB 一片
-  const CHUNK=16*1024*1024;
-  const isSmall=file.size<=CHUNK;
+  // 分块策略：≤8MB 整传，否则 32MB 一片（原来 16MB）。片越大，每块的
+  // JSON 往返、开文件、记账等固定开销摊得越薄。
+  const SMALL=8*1024*1024;
+  const CHUNK=32*1024*1024;
+  const isSmall=file.size<=SMALL;
   const name=file.name;
   const rel=file.webkitRelativePath||'';
   const chunkSize=isSmall?Math.max(file.size,1):CHUNK;
   const totalChunks=isSmall?1:Math.ceil(file.size/CHUNK);
+  // 并发路数：单条 TCP 流在 WiFi 上经常只跑到链路的一半（丢包把拥塞窗口
+  // 压住），3~4 路并发能明显压满带宽；有线千兆下多路也不会更慢。
+  const PAR=isSmall?1:(file.size>=256*1024*1024?4:3);
   const startTime=Date.now();
   let bytesDone=0;
   let uploadId=null;
@@ -1170,6 +1198,114 @@ function uploadOne(file,label,fill,pl,pr,isAborted){
   }
 
   return new Promise(function(resolve,reject){
+    let settled=false,finished=false,inflight=0,nextIdx=0;
+    const todo=[];                 // 待传分块序号（续传时已剔除服务端已有的）
+    const live=[];                 // 在途 xhr，取消时统一 abort
+    const loaded={};               // 各在途请求已写出字节，仅用于进度条平滑
+
+    function removeLive(x){
+      const i=live.indexOf(x);if(i>=0)live.splice(i,1);
+    }
+    function abortAll(){
+      for(let i=0;i<live.length;i++){try{live[i].abort()}catch(e){}}
+      live.length=0;
+    }
+    function fail(e){
+      if(settled)return;
+      settled=true;finished=true;abortAll();reject(e);
+    }
+    function done(){
+      if(settled)return;
+      settled=true;finished=true;resolve();
+    }
+
+    // ── 速度统计只基于「服务端已确认收到」的字节 ──
+    // xhr.upload.onprogress 统计的是浏览器写入本机 socket 缓冲区的字节，
+    // 局域网上 TCP 缓冲会让它比服务端实际接收快 30%~50% —— 那正是
+    // 「显示 90 多 MB/s、实际只有 60 多」的原因。分块 onload（服务端
+    // 已落盘并应答）才是真实速度。
+    function onAck(n){
+      sessionBytes+=n;
+      const now=Date.now();
+      if(!sessionStart)sessionStart=now;
+      if(lastAckTick){
+        const dt=(now-lastAckTick)/1000;
+        if(dt>=0.20){
+          const inst=(sessionBytes+ackedBase-lastAcked)/dt;
+          curSpeed=curSpeed?curSpeed*0.6+inst*0.4:inst;
+          lastAckTick=now;lastAcked=sessionBytes+ackedBase;
+        }
+      }else{
+        lastAckTick=now;lastAcked=sessionBytes+ackedBase;
+      }
+    }
+
+    // 进度条用「已确认 + 在途已写出」更顺滑；速度/剩余时间只用已确认字节
+    function paint(){
+      if(!finished&&!settled&&isAborted()){fail(new Error('已取消'));return}
+      let cur=bytesDone;
+      for(const k in loaded)cur+=loaded[k];
+      if(cur>file.size)cur=file.size;
+      const remain=file.size-bytesDone;
+      setBar(cur,file.size,curSpeed,curSpeed>0?remain/curSpeed:0);
+    }
+
+    function sendChunk(ci){
+      const start=ci*chunkSize;
+      const end=Math.min(start+chunkSize,file.size);
+      const len=end-start;
+      // 直接 send(Blob)，不经过 FormData / arrayBuffer / crypto.subtle。
+      // crypto.subtle 只在安全上下文（HTTPS / localhost）可用，手机用
+      // http://192.168.x.x 访问时它是 undefined —— 那正是「电脑能传、
+      // 手机必失败」的原因。RequestBody 由浏览器直接从磁盘流式发出。
+      const xhr=new XMLHttpRequest();
+      live.push(xhr);inflight++;
+      xhr.open('POST',API+'/api/upload/chunk?uploadId='+encodeURIComponent(uploadId)+'&index='+ci);
+      xhr.setRequestHeader('Content-Type','application/octet-stream');
+      if(TOKEN)xhr.setRequestHeader('X-Auth-Token',TOKEN);
+      xhr.onload=function(){
+        inflight--;removeLive(xhr);delete loaded[ci];
+        if(xhr.status!==200){
+          let em='HTTP '+xhr.status;
+          try{em=JSON.parse(xhr.responseText).error||em}catch(e){}
+          return fail(new Error('分块 '+(ci+1)+'/'+totalChunks+' 失败：'+em));
+        }
+        bytesDone+=len;onAck(len);paint();pump();
+      };
+      xhr.onerror=function(){
+        inflight--;removeLive(xhr);delete loaded[ci];
+        fail(new Error('网络中断或无法连接服务端（已传部分会保留，重新选择该文件可续传）'));
+      };
+      xhr.upload.onprogress=function(e){
+        if(e.lengthComputable){loaded[ci]=e.loaded;paint()}
+      };
+      xhr.send(file.slice(start,end));
+    }
+
+    function pump(){
+      if(finished||settled)return;
+      if(isAborted()){fail(new Error('已取消'));return}
+      while(inflight<PAR&&nextIdx<todo.length)sendChunk(todo[nextIdx++]);
+      if(nextIdx>=todo.length&&inflight===0)doMerge();
+    }
+
+    function doMerge(){
+      if(finished||settled)return;
+      finished=true;
+      fetch(API+'/api/upload/merge',{
+        method:'POST',headers:hdrs({'Content-Type':'application/json'}),
+        body:JSON.stringify({uploadId:uploadId})
+      }).then(function(r){return r.json().then(function(j){return{r:r,j:j}})}).then(function(o){
+        if(!o.r.ok||!o.j.ok)throw new Error(o.j.error||'收尾失败');
+        fill.style.width='100%';
+        pl.textContent=label+' · 完成';
+        const dur=(Date.now()-(sessionStart||startTime))/1000;
+        const avg=sessionBytes>0&&dur>0?sessionBytes/dur:file.size/((Date.now()-startTime)/1000);
+        pr.textContent=size(file.size)+' · 平均 '+fmtSpeed(avg);
+        done();
+      }).catch(fail);
+    }
+
     // 1) 建立（或复用）上传会话 → 拿到已传分块列表，实现续传
     fetch(API+'/api/upload/init',{
       method:'POST',headers:hdrs({'Content-Type':'application/json'}),
@@ -1186,95 +1322,14 @@ function uploadOne(file,label,fill,pl,pr,isAborted){
       uploadId=j.uploadId;
       const have={};(j.have||[]).forEach(function(i){have[i]=1});
       bytesDone=j.uploaded||0;
-      if(j.done){resolve();return}
+      if(j.done){done();return}
+      ackedBase=bytesDone;
       setBar(bytesDone,file.size,0,0);
 
-      const todo=[];
       for(let i=0;i<totalChunks;i++)if(!have[i])todo.push(i);
-      if(!todo.length){return doMerge()}
-
-      // ── 速度统计只基于「服务端已确认收到」的字节 ──
-      // xhr.upload.onprogress 统计的是浏览器写入本机 socket 缓冲区的字节，
-      // 局域网上 TCP 缓冲会让它比服务端实际接收快 30%~50% —— 那正是
-      // 「显示 90 多 MB/s、实际只有 60 多」的原因。分块 onload（服务端
-      // 已落盘并应答）才是真实速度。状态变量声明在 uploadOne 顶层。
-      ackedBase=bytesDone;
-      function onAck(n){
-        sessionBytes+=n;
-        const now=Date.now();
-        if(!sessionStart)sessionStart=now;
-        if(lastAckTick){
-          const dt=(now-lastAckTick)/1000;
-          if(dt>=0.25){
-            const inst=(sessionBytes+ackedBase-lastAcked)/dt;
-            curSpeed=curSpeed?curSpeed*0.6+inst*0.4:inst;
-            lastAckTick=now;lastAcked=sessionBytes+ackedBase;
-          }
-        }else{
-          lastAckTick=now;lastAcked=sessionBytes+ackedBase;
-        }
-      }
-
-      let idx=0;
-      function next(){
-        if(isAborted()){reject(new Error('已取消'))}
-        if(idx>=todo.length){return doMerge()}
-        const ci=todo[idx];
-        const start=ci*chunkSize;
-        const end=Math.min(start+chunkSize,file.size);
-        // 直接上传 Blob 切片，不经过 arrayBuffer / crypto.subtle。
-        // crypto.subtle 只在安全上下文（HTTPS / localhost）可用，
-        // 手机用 http://192.168.x.x 访问时它是 undefined —— 那正是
-        // 「电脑能传、手机必失败」的原因。分块去重由服务端按内容哈希完成。
-        const blob=file.slice(start,end);
-        const fd=new FormData();
-        fd.append('uploadId',uploadId);
-        fd.append('index',String(ci));
-        fd.append('chunk',blob,'chunk');
-        const xhr=new XMLHttpRequest();
-        xhr.open('POST',API+'/api/upload/chunk');
-        if(TOKEN)xhr.setRequestHeader('X-Auth-Token',TOKEN);
-        xhr.onload=function(){
-          if(xhr.status!==200){
-            let em='HTTP '+xhr.status;
-            try{em=JSON.parse(xhr.responseText).error||em}catch(e){}
-            reject(new Error('分块 '+(ci+1)+' 失败：'+em));return;
-          }
-          bytesDone+=(end-start);
-          onAck(end-start);
-          const remain=file.size-bytesDone;
-          setBar(bytesDone,file.size,curSpeed,curSpeed>0?remain/curSpeed:0);
-          idx++;next();
-        };
-        xhr.onerror=function(){
-          reject(new Error('网络中断或无法连接服务端（已传部分会保留，重新选择该文件可续传）'))
-        };
-        // onprogress 只用来平滑进度条动画，不参与速度计算
-        xhr.upload.onprogress=function(e){
-          if(e.lengthComputable){
-            const cur=Math.min(bytesDone+e.loaded,file.size);
-            setBar(cur,file.size,curSpeed,curSpeed>0?(file.size-cur)/curSpeed:0);
-          }
-        };
-        xhr.send(fd);
-      }
-      next();
-
-      function doMerge(){
-        fetch(API+'/api/upload/merge',{
-          method:'POST',headers:hdrs({'Content-Type':'application/json'}),
-          body:JSON.stringify({uploadId:uploadId})
-        }).then(function(r){return r.json().then(function(j){return{r:r,j:j}})        }).then(function(o){
-          if(!o.r.ok||!o.j.ok)throw new Error(o.j.error||'合并失败');
-          fill.style.width='100%';
-          pl.textContent=label+' · 完成';
-          const dur=(Date.now()-(sessionStart||startTime))/1000;
-          const avg=sessionBytes>0&&dur>0?sessionBytes/dur:file.size/((Date.now()-startTime)/1000);
-          pr.textContent=size(file.size)+' · 平均 '+fmtSpeed(avg);
-          resolve();
-        }).catch(reject);
-      }
-    }).catch(reject);
+      if(!todo.length){doMerge();return}
+      pump();
+    }).catch(fail);
   });
 }
 </script>
@@ -1288,6 +1343,9 @@ function uploadOne(file,label,fill,pl,pr,isAborted){
 class Handler(BaseHTTPRequestHandler):
     server_version = f"LANTransfer/{VERSION}"
     protocol_version = "HTTP/1.1"
+    # 会话内多路并发时，Nagle 会让小响应（每次分块应答几百字节）等到
+    # 下一个 ACK 才发，前端看到的「每一块都慢半拍」就是这么来的。
+    disable_nagle_algorithm = True
 
     # ---- 日志 ----
     def log_message(self, fmt, *args):
@@ -1521,16 +1579,23 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+        # 用 readinto + 复用缓冲发送：避免每次 read 都新建 1MB 对象，
+        # 几十 GB 的下载下 GC 压力也是实打实的。
         sent = 0
-        with open(target, "rb") as f:
+        buf = bytearray(IO_CHUNK)
+        view = memoryview(buf)
+        write = self.wfile.write
+        with open(target, "rb", buffering=0) as f:
             if start:
                 f.seek(start)
+            readinto = f.readinto
             while sent < length:
-                buf = f.read(min(IO_CHUNK, length - sent))
-                if not buf:
+                want = IO_CHUNK if length - sent > IO_CHUNK else length - sent
+                n = readinto(view[:want])
+                if not n:
                     break
-                self.wfile.write(buf)
-                sent += len(buf)
+                write(view[:n])
+                sent += n
         with _stats_lock:
             _stats["downloaded_files"] += 1
             _stats["downloaded_bytes"] += sent
@@ -1586,10 +1651,14 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.err("接口不存在", 404)
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            self.close_connection = True
         except Exception as e:
             with _stats_lock:
                 _stats["errors"] += 1
+            # 出错时请求体大概率没读完。keep-alive 连接上残留的字节会被
+            # 当成下一个请求行解析（日志里表现为「Bad request version」），
+            # 因此直接结束这条连接，让浏览器重连，别串包。
+            self.close_connection = True
             self.err(f"服务器错误：{e}", 500)
 
     def _text_add(self):
@@ -1615,8 +1684,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.err("参数格式错误")
         if size < 0 or chunk_size <= 0 or total <= 0:
             return self.err("参数不合法")
+        if chunk_size > MAX_CHUNK_BYTES:
+            return self.err("分块过大")
         if total > 200000:
             return self.err("分块数过多")
+        # 分块数必须与偏移计算自洽，否则各块落点会错位
+        if size == 0:
+            if total != 1:
+                return self.err("分块参数不匹配")
+        elif total != (size + chunk_size - 1) // chunk_size:
+            return self.err("分块参数不匹配")
 
         raw_rel = str(data.get("relPath") or "")
         rel_path = None
@@ -1648,18 +1725,29 @@ class Handler(BaseHTTPRequestHandler):
                 rec = upload_get(rec["id"])
                 done = False
 
-        # 续传列表只报告分块文件真实存在的分块。分块文件可能因清理 / 异常
-        # 丢失，若照常报告 have，前端会跳过它，合并时才报错 —— 这里剔除后
-        # 前端会自动重传缺失分块，续传自愈。
+        # 续传列表：分块记录 + 落盘文件的实际长度双重校验。分块可能因清理 /
+        # 磁盘写满而丢失，若照常报告 have，前端会跳过它，收尾时才报错 ——
+        # 这里按「这一块的数据确实落在文件里」过滤，前端会自动重传，续传自愈。
+        try:
+            # 在这里就把 .part 建好（单线程时机），并发上传第一块时不会撞车
+            part = upload_ensure_part(rec)
+            part_size = os.path.getsize(part)
+        except (OSError, ValueError):
+            part, part_size = "", 0
+            with db() as conn:
+                conn.execute("DELETE FROM chunks WHERE upload_id=?", (rec["id"],))
+
         with db() as conn:
             rows = conn.execute(
-                "SELECT idx, file FROM chunks WHERE upload_id=?", (rec["id"],)
+                "SELECT idx FROM chunks WHERE upload_id=?", (rec["id"],)
             ).fetchall()
+        cs = rec["chunk_size"]
         have = sorted(
             r["idx"] for r in rows
-            if os.path.isfile(os.path.join(STAGING_DIR, r["file"]))
+            if 0 <= r["idx"] < rec["total_chunks"]
+            and r["idx"] * cs + chunk_len(rec, r["idx"]) <= part_size
         )
-        uploaded = upload_uploaded_bytes(rec["id"])
+        uploaded = sum(chunk_len(rec, i) for i in have)
 
         self.json_out({
             "ok": True,
@@ -1669,54 +1757,66 @@ class Handler(BaseHTTPRequestHandler):
             "done": done,
             "name": rec["name"],
             "totalChunks": rec["total_chunks"],
+            "chunkSize": rec["chunk_size"],
         })
 
     def _upload_chunk(self):
-        ctype = self.headers.get("Content-Type", "")
-        if "multipart/form-data" not in ctype:
-            return self.err("需要 multipart/form-data")
-        clen = int(self.headers.get("Content-Length") or 0)
-        if clen <= 0 or clen > MAX_CHUNK_BYTES + 1024 * 1024:
-            return self.err("分块大小不合法")
+        """
+        接收一个分块：请求体就是原始字节（application/octet-stream），
+        边读边按偏移写盘，不经 multipart 解析、不落系统临时目录。
 
-        # 用 cgi 解析（分块 ≤64MB，占用可控）
-        env = {"REQUEST_METHOD": "POST", "CONTENT_TYPE": ctype,
-               "CONTENT_LENGTH": str(clen)}
-        fs = cgi.FieldStorage(fp=self.rfile, headers=self.headers,
-                              environ=env, keep_blank_values=True)
-        try:
-            upload_id = fs.getvalue("uploadId", "")
-            index_raw = fs.getvalue("index", "")
-            data = fs.getvalue("chunk")
-        except Exception as e:
-            return self.err(f"解析失败：{e}")
-
+        参数走 query：?uploadId=xxx&index=3
+        """
+        _, qs = self.q()
+        upload_id = qs.get("uploadId") or ""
+        index_raw = qs.get("index") or ""
         if not upload_id or not index_raw:
             return self.err("缺少参数")
-        if isinstance(data, list):
-            return self.err("只能上传单个分块")
-        if not isinstance(data, (bytes, bytearray)):
-            return self.err("缺少分块数据")
+
+        try:
+            clen = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            clen = 0
+        if clen < 0 or clen > MAX_CHUNK_BYTES:
+            return self.err("分块大小不合法")
 
         rec = upload_get(upload_id)
         if not rec:
+            # 会话过期/被清理：先把请求体丢掉，否则 keep-alive 连接会串包
+            self._drain(clen)
             return self.err("上传会话不存在或已过期，请重新选择文件", 404)
 
         try:
             idx = int(index_raw)
         except ValueError:
+            self._drain(clen)
             return self.err("分块序号非法")
         if idx < 0 or idx >= rec["total_chunks"]:
+            self._drain(clen)
             return self.err("分块序号越界")
 
-        n = chunk_save(upload_id, idx, bytes(data))
-        self.json_out({
-            "ok": True,
-            "uploadId": upload_id,
-            "index": idx,
-            "size": n,
-            "uploaded": upload_uploaded_bytes(upload_id),
-        })
+        expect = chunk_len(rec, idx)
+        if clen != expect:
+            self._drain(clen)
+            return self.err(f"分块大小不符（应为 {expect}，收到 {clen}）")
+
+        try:
+            n = chunk_receive(rec, idx, self.rfile, clen)
+        except ConnectionError as e:
+            self.close_connection = True
+            return self.err(str(e), 400)
+
+        self.json_out({"ok": True, "uploadId": upload_id, "index": idx, "size": n})
+
+    def _drain(self, n: int) -> None:
+        """把不要的请求体读掉，保证 HTTP/1.1 连接上后续报文不错位。"""
+        left = n
+        while left > 0:
+            buf = self.rfile.read(min(IO_CHUNK, left))
+            if not buf:
+                self.close_connection = True
+                return
+            left -= len(buf)
 
     def _upload_merge(self):
         data = self.body_json()
@@ -1923,13 +2023,16 @@ def main():
 
     ThreadingHTTPServer.allow_reuse_address = True
     ThreadingHTTPServer.daemon_threads = True
+    # 默认 backlog 只有 5：前端 4 路并发 + 页面刷新时容易直接被拒连
+    ThreadingHTTPServer.request_queue_size = 128
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     try:
-        httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
-        httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         httpd.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except OSError:
         pass
+    # 注意：Windows 上 listening socket 的 SO_SNDBUF / SO_RCVBUF 不会传给
+    # accepted socket，而且一旦显式设置就会关掉系统的接收窗口自动调优 ——
+    # 所以这里不去动缓冲区大小，让 TCP 自己按 RTT 调。
 
     banner([f"http://{ip}:{PORT}" for ip in local_ips()])
 

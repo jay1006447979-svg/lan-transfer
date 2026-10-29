@@ -19,7 +19,7 @@ import sys
 import time
 
 
-APP_TITLE = "LAN Transfer 2.0"
+APP_TITLE = "LAN Transfer 2.2"
 LINE = "=" * 64
 
 
@@ -67,8 +67,14 @@ def print_usage(argv: list) -> None:
     print("    手机上传的文件也会存到这里。")
     print()
     print("  【上传大文件】")
-    print("    自动分块 + 断点续传。中途断网、锁屏、关掉网页都不要紧，")
+    print("    自动分块 + 多路并发 + 断点续传。中途断网、锁屏、关掉网页都不要紧，")
     print("    重新选择同一个文件会接着传，不用从头再来。")
+    print()
+    print("  【为什么传得不够快？】")
+    print("    · 有线千兆最稳；Wi-Fi 请连 5GHz，别连 2.4GHz")
+    print("    · Windows Defender 实时扫描会边写边查，明显拖慢大文件，")
+    print("      可在「Windows 安全中心 → 病毒防护 → 排除项」里把共享目录加进去")
+    print("    · 两边都走 Wi-Fi 时，实际速度大约只有标称速率的一半")
     print()
     print("  【手机上选不了文件夹？】")
     print("    这是手机浏览器的限制（桌面浏览器才支持选目录）。")

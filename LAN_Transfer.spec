@@ -21,8 +21,9 @@ a = Analysis(
     hiddenimports=[
         # server 是通过 import server 动态加载的，且内部用到这些标准库，
         # 显式声明可避免打包器静态分析漏掉。
+        # 注意：v2.2 起不再使用 cgi 模块（Python 3.13 已移除它），
+        # 上传请求体是原始二进制直接落盘。
         'server',
-        'cgi',
         'http.server',
         'sqlite3',
         'zipfile',
@@ -37,7 +38,7 @@ a = Analysis(
         'json',
         'struct',
         'urllib.parse',
-        # cgi / http.server / zipfile 的间接依赖，必须显式带上
+        # http.server / zipfile 的间接依赖，必须显式带上
         'email',
         'email.parser',
         'email.message',
