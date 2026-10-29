@@ -337,7 +337,12 @@ def chunk_len(rec, idx: int) -> int:
 
 
 def upload_create(name, rel_path, size, chunk_size, total_chunks, mtime):
-    """新建上传会话；若同名同大小同 chunk_size 的会话已存在，直接复用（断点续传）。"""
+    """
+    新建上传会话：
+      · 有同名同大小同分块尺寸的 active 会话 → 复用它（断点续传）；
+      · 该文件此前已经传完（名字 / 大小 / 修改时间都对得上） → 直接返回完成态，
+        前端拿到 done=True 立即结束，不会把几 GB 的文件再传一遍。
+    """
     now = time.time()
     with db() as conn:
         row = conn.execute(
@@ -346,6 +351,16 @@ def upload_create(name, rel_path, size, chunk_size, total_chunks, mtime):
                  AND chunk_size=? AND status='active'
                ORDER BY updated_at DESC LIMIT 1""",
             (name, rel_path, size, chunk_size),
+        ).fetchone()
+        if row:
+            return dict(row)
+        row = conn.execute(
+            """SELECT * FROM uploads
+               WHERE name=? AND IFNULL(rel_path,'')=IFNULL(?,'') AND size=?
+                 AND chunk_size=? AND status='done'
+                 AND ABS(IFNULL(mtime,0)-?) < 2
+               ORDER BY updated_at DESC LIMIT 1""",
+            (name, rel_path, size, chunk_size, mtime or 0),
         ).fetchone()
         if row:
             return dict(row)
@@ -1322,7 +1337,13 @@ function uploadOne(file,label,fill,pl,pr,isAborted){
       uploadId=j.uploadId;
       const have={};(j.have||[]).forEach(function(i){have[i]=1});
       bytesDone=j.uploaded||0;
-      if(j.done){done();return}
+      if(j.done){
+        // 同名、同大小、同修改时间的文件服务端已经有了 —— 直接跳过
+        fill.style.width='100%';
+        pl.textContent=label+' · 服务器上已有相同文件，跳过';
+        pr.textContent=size(file.size);
+        done();return
+      }
       ackedBase=bytesDone;
       setBar(bytesDone,file.size,0,0);
 
@@ -1729,9 +1750,14 @@ class Handler(BaseHTTPRequestHandler):
         # 磁盘写满而丢失，若照常报告 have，前端会跳过它，收尾时才报错 ——
         # 这里按「这一块的数据确实落在文件里」过滤，前端会自动重传，续传自愈。
         try:
-            # 在这里就把 .part 建好（单线程时机），并发上传第一块时不会撞车
-            part = upload_ensure_part(rec)
-            part_size = os.path.getsize(part)
+            if done:
+                # 已经传完的会话只需回状态，别再建临时件 —— 否则每次重传
+                # 一个已完成的文件都会在目录里留下一个空 .part
+                part, part_size = "", 0
+            else:
+                # 在这里就把 .part 建好（单线程时机），并发上传第一块时不会撞车
+                part = upload_ensure_part(rec)
+                part_size = os.path.getsize(part)
         except (OSError, ValueError):
             part, part_size = "", 0
             with db() as conn:
